@@ -2,7 +2,7 @@
 
 # name: discourse-password-reset-webhook
 # about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq).
-# version: 1.3.0
+# version: 1.4.0
 # authors: you
 
 after_initialize do
@@ -76,7 +76,6 @@ after_initialize do
 
     def self.enqueue(form)
       return unless enabled?
-
       Jobs.enqueue(:password_reset_webhook_post, form: form)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] enqueue failed: #{e.class}: #{e.message}")
@@ -105,35 +104,34 @@ after_initialize do
     end
   end
 
-  # ------------------------------------------------------------
-  # Hook: password reset requested (UsersController#forgot_password)
-  # ------------------------------------------------------------
-  begin
-    if defined?(::UsersController)
-      ::UsersController.class_eval do
-        alias_method :_prw_original_forgot_password, :forgot_password
+  installed = []
 
+  # ============================================================
+  # 1) Password reset requested: SessionController#forgot_password
+  # ============================================================
+  begin
+    if defined?(::SessionController) && ::SessionController.method_defined?(:forgot_password)
+      module ::PasswordResetWebhook::SessionForgotPasswordPatch
         def forgot_password
           req = request
           ip = (req&.remote_ip rescue nil)
           ua = (req&.user_agent rescue nil)
 
-          email = nil
+          login = nil
           begin
-            email = params[:login] || params[:email] || params["login"] || params["email"]
+            login = params[:login] || params[:email] || params["login"] || params["email"]
           rescue
-            email = nil
+            login = nil
           end
 
-          result = _prw_original_forgot_password
+          result = super
 
-          # If controller returned a 2xx we treat as success; otherwise failure
           success = (response.status.to_i >= 200 && response.status.to_i < 300)
 
           form = ::PasswordResetWebhook.build_form(
             event_name: "password_reset_requested",
-            user: (current_user rescue nil), # usually nil for forgot_password; fine
-            email: email,
+            user: nil,
+            email: login,
             reset_token: nil,
             success: success,
             request_ip: ip,
@@ -143,90 +141,100 @@ after_initialize do
           ::PasswordResetWebhook.enqueue(form)
 
           result
-        rescue => e
-          Rails.logger.warn("[discourse-password-reset-webhook] forgot_password hook error: #{e.class}: #{e.message}")
-          raise
         end
       end
+
+      ::SessionController.prepend(::PasswordResetWebhook::SessionForgotPasswordPatch)
+      installed << "SessionController#forgot_password"
     else
-      Rails.logger.warn("[discourse-password-reset-webhook] UsersController not found; request hook not installed.")
+      Rails.logger.warn("[discourse-password-reset-webhook] SessionController#forgot_password not found; request hook not installed.")
     end
   rescue => e
-    Rails.logger.warn("[discourse-password-reset-webhook] failed to patch UsersController#forgot_password: #{e.class}: #{e.message}")
+    Rails.logger.warn("[discourse-password-reset-webhook] failed to patch SessionController#forgot_password: #{e.class}: #{e.message}")
   end
 
-  # ------------------------------------------------------------
-  # Hook: password reset completed (UsersController#password_reset)
-  # ------------------------------------------------------------
+  # ============================================================
+  # 2) Password reset completed: UsersController (method varies)
+  # ============================================================
   begin
-    if defined?(::UsersController) && ::UsersController.method_defined?(:password_reset)
-      ::UsersController.class_eval do
-        alias_method :_prw_original_password_reset, :password_reset
+    if defined?(::UsersController)
+      candidates = [
+        :password_reset,          # some versions
+        :password_reset_perform,  # some versions
+        :reset_password,          # some versions
+        :update_password,         # some versions
+        :password_reset_update    # some versions
+      ]
 
-        def password_reset
-          req = request
-          ip = (req&.remote_ip rescue nil)
-          ua = (req&.user_agent rescue nil)
+      found = candidates.find { |m| ::UsersController.method_defined?(m) }
 
-          # token param name varies; cover common ones
-          token = nil
-          begin
-            token =
-              params[:token] || params[:reset_token] || params[:password_reset_token] ||
-              params["token"] || params["reset_token"] || params["password_reset_token"]
-          rescue
+      if found
+        patch_mod = Module.new do
+          define_method(found) do
+            req = request
+            ip = (req&.remote_ip rescue nil)
+            ua = (req&.user_agent rescue nil)
+
             token = nil
-          end
+            begin
+              token =
+                params[:token] || params[:reset_token] || params[:password_reset_token] ||
+                params["token"] || params["reset_token"] || params["password_reset_token"]
+            rescue
+              token = nil
+            end
 
-          result = _prw_original_password_reset
+            result = super()
 
-          success = (response.status.to_i >= 200 && response.status.to_i < 300)
+            success = (response.status.to_i >= 200 && response.status.to_i < 300)
 
-          user = nil
-          begin
-            # if a user is logged in at this moment use it; otherwise best-effort lookup via token is not safe here
-            user = (current_user rescue nil)
-          rescue
-            user = nil
-          end
-
-          form = ::PasswordResetWebhook.build_form(
-            event_name: "password_reset_completed",
-            user: user,
-            email: nil,
-            reset_token: token,
-            success: success,
-            request_ip: ip,
-            user_agent: ua,
-            occurred_at_utc: Time.now.utc.iso8601
-          )
-          ::PasswordResetWebhook.enqueue(form)
-
-          result
-        rescue => e
-          # Try to also send failure event
-          begin
             form = ::PasswordResetWebhook.build_form(
               event_name: "password_reset_completed",
-              user: (current_user rescue nil),
+              user: (current_user rescue nil), # may be nil; that's OK
               email: nil,
-              reset_token: (params[:token] rescue nil),
-              success: false,
-              request_ip: (request&.remote_ip rescue nil),
-              user_agent: (request&.user_agent rescue nil),
+              reset_token: token,
+              success: success,
+              request_ip: ip,
+              user_agent: ua,
               occurred_at_utc: Time.now.utc.iso8601
             )
             ::PasswordResetWebhook.enqueue(form)
-          rescue
-            # ignore
+
+            result
+          rescue => e
+            # try to report failure event too
+            begin
+              form = ::PasswordResetWebhook.build_form(
+                event_name: "password_reset_completed",
+                user: (current_user rescue nil),
+                email: nil,
+                reset_token: (params[:token] rescue nil),
+                success: false,
+                request_ip: (request&.remote_ip rescue nil),
+                user_agent: (request&.user_agent rescue nil),
+                occurred_at_utc: Time.now.utc.iso8601
+              )
+              ::PasswordResetWebhook.enqueue(form)
+            rescue
+              # ignore
+            end
+            raise
           end
-          raise
         end
+
+        ::UsersController.prepend(patch_mod)
+        installed << "UsersController##{found}"
+      else
+        Rails.logger.warn("[discourse-password-reset-webhook] No known UsersController password-reset action found (tried: #{candidates.join(", ")}). Completion hook not installed.")
       end
     else
-      Rails.logger.warn("[discourse-password-reset-webhook] UsersController#password_reset not found; completion hook not installed.")
+      Rails.logger.warn("[discourse-password-reset-webhook] UsersController not found; completion hook not installed.")
     end
   rescue => e
-    Rails.logger.warn("[discourse-password-reset-webhook] failed to patch UsersController#password_reset: #{e.class}: #{e.message}")
+    Rails.logger.warn("[discourse-password-reset-webhook] failed to patch UsersController password-reset action: #{e.class}: #{e.message}")
+  end
+
+  if installed.any?
+    Rails.logger.warn("[discourse-password-reset-webhook] installed hooks: #{installed.join(" | ")}")
   end
 end
