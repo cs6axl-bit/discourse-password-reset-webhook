@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: discourse-password-reset-webhook
-# about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed.
-# version: 1.1.1
+# about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq).
+# version: 1.2.0
 # authors: you
 
 after_initialize do
@@ -19,16 +19,14 @@ after_initialize do
 
     # Set false to disable quickly without uninstalling plugin
     ENABLED       = true
-
     # =========================
 
     def self.enabled?
       ENABLED && ENDPOINT_URL.to_s.strip.length > 0
     end
 
-    def self.post_form(event_name:, user: nil, reset_token: nil, success: nil, request_ip: nil, user_agent: nil, occurred_at_utc: nil)
-      return unless enabled?
-
+    def self.build_form(event_name:, user_id: nil, username: nil, email: nil, reset_token_sha256: nil,
+                        success: nil, request_ip: nil, user_agent: nil, occurred_at_utc: nil)
       occurred_at_utc ||= Time.now.utc.iso8601
 
       form = {
@@ -36,16 +34,13 @@ after_initialize do
         "occurred_at_utc" => occurred_at_utc.to_s
       }
 
-      if user
-        form["user_id"] = user.id.to_s
-        form["username"] = user.username.to_s
-        form["email"] = user.email.to_s
+      if user_id
+        form["user_id"] = user_id.to_s
+        form["username"] = username.to_s if username
+        form["email"] = email.to_s if email
       end
 
-      # Never send raw token; only sha256 (matches your PHP column)
-      if reset_token && reset_token.to_s.length > 0
-        form["reset_token_sha256"] = Digest::SHA256.hexdigest(reset_token.to_s)
-      end
+      form["reset_token_sha256"] = reset_token_sha256.to_s if reset_token_sha256 && reset_token_sha256.to_s.length > 0
 
       if success == true
         form["success"] = "1"
@@ -59,6 +54,12 @@ after_initialize do
       sec = SECRET_FIELD.to_s.strip
       form["secret"] = sec if sec.length > 0
 
+      form
+    end
+
+    def self.post_form_now(form)
+      return unless enabled?
+
       body = URI.encode_www_form(form)
 
       FinalDestination::HTTP.post(
@@ -68,8 +69,60 @@ after_initialize do
         timeout: TIMEOUT_SEC,
         open_timeout: OPEN_TIMEOUT
       )
+    end
+
+    def self.enqueue(event_name:, user: nil, reset_token: nil, success: nil, request_ip: nil, user_agent: nil, occurred_at_utc: nil)
+      return unless enabled?
+
+      user_id = user&.id
+      username = user&.username
+      email = user&.email
+
+      reset_token_sha256 = nil
+      if reset_token && reset_token.to_s.length > 0
+        reset_token_sha256 = Digest::SHA256.hexdigest(reset_token.to_s)
+      end
+
+      form = build_form(
+        event_name: event_name,
+        user_id: user_id,
+        username: username,
+        email: email,
+        reset_token_sha256: reset_token_sha256,
+        success: success,
+        request_ip: request_ip,
+        user_agent: user_agent,
+        occurred_at_utc: occurred_at_utc
+      )
+
+      Jobs.enqueue(
+        :password_reset_webhook_post,
+        form: form
+      )
     rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] webhook failed: #{e.class}: #{e.message}")
+      Rails.logger.warn("[#{PLUGIN_NAME}] enqueue failed: #{e.class}: #{e.message}")
+    end
+  end
+
+  # ----------------------------
+  # Sidekiq Job
+  # ----------------------------
+  module ::Jobs
+    class PasswordResetWebhookPost < ::Jobs::Base
+      sidekiq_options retry: 10
+
+      def execute(args)
+        form = args["form"] || args[:form]
+        unless form.is_a?(Hash)
+          Rails.logger.warn("[#{::PasswordResetWebhook::PLUGIN_NAME}] job got invalid form payload")
+          return
+        end
+
+        ::PasswordResetWebhook.post_form_now(form)
+      rescue => e
+        Rails.logger.warn("[#{::PasswordResetWebhook::PLUGIN_NAME}] webhook failed in job: #{e.class}: #{e.message}")
+        raise # keep retries
+      end
     end
   end
 
@@ -97,7 +150,7 @@ after_initialize do
           ua = nil
         end
 
-        ::PasswordResetWebhook.post_form(
+        ::PasswordResetWebhook.enqueue(
           event_name: "password_reset_requested",
           user: user,
           reset_token: nil,
@@ -138,7 +191,7 @@ after_initialize do
 
           result = _prw_original_perform!
 
-          ::PasswordResetWebhook.post_form(
+          ::PasswordResetWebhook.enqueue(
             event_name: "password_reset_completed",
             user: user,
             reset_token: token,
@@ -152,7 +205,7 @@ after_initialize do
         rescue => e
           # report failure too (optional, but useful)
           begin
-            ::PasswordResetWebhook.post_form(
+            ::PasswordResetWebhook.enqueue(
               event_name: "password_reset_completed",
               user: (self.user rescue nil),
               reset_token: (self.token rescue nil),
