@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 # name: discourse-password-reset-webhook
-# about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq).
-# version: 1.5.0
+# about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq). Also reports login attempts.
+# version: 1.6.0
 # authors: you
 
 after_initialize do
@@ -58,8 +58,23 @@ after_initialize do
       false
     end
 
+    # Best-effort: resolve a Discourse user from a "login" field (username or email).
+    # Returns User or nil. Never raises.
+    def self.find_user_from_login(login)
+      v = login.to_s.strip
+      return nil if v.empty?
+
+      if v.include?("@")
+        User.find_by_email(v)
+      else
+        User.find_by_username(v) || User.find_by_username_lower(v.downcase)
+      end
+    rescue StandardError
+      nil
+    end
+
     def self.build_form(event_name:, user: nil, email: nil, reset_token: nil, success: nil,
-                        request_ip: nil, user_agent: nil, occurred_at_utc: nil)
+                        request_ip: nil, user_agent: nil, occurred_at_utc: nil, extra: nil)
       occurred_at_utc ||= Time.now.utc.iso8601
 
       form = {
@@ -88,6 +103,18 @@ after_initialize do
 
       form["request_ip"] = request_ip.to_s if request_ip && request_ip.to_s.length > 0
       form["user_agent"] = user_agent.to_s if user_agent && user_agent.to_s.length > 0
+
+      if extra.is_a?(Hash)
+        extra.each do |k, v|
+          next if k.nil?
+          key = k.to_s
+          next if key.strip.empty?
+          next if v.nil?
+          val = v.to_s
+          next if val.strip.empty?
+          form[key] = val
+        end
+      end
 
       sec = SECRET_FIELD.to_s.strip
       form["secret"] = sec if sec.length > 0
@@ -156,6 +183,70 @@ after_initialize do
   end
 
   installed = []
+
+  # ============================================================
+  # 0) Login attempt: SessionController#create
+  # ============================================================
+  begin
+    if defined?(::SessionController) && ::SessionController.method_defined?(:create)
+      module ::PasswordResetWebhook::SessionLoginAttemptPatch
+        def create(*args)
+          req = request
+          ip = (req&.remote_ip rescue nil)
+          ua = (req&.user_agent rescue nil)
+
+          login = nil
+          begin
+            login =
+              params[:login] || params[:username] || params[:email] ||
+              params["login"] || params["username"] || params["email"]
+          rescue StandardError
+            login = nil
+          end
+
+          # Call core login handler first
+          result = super(*args)
+
+          # Best-effort success signal (same approach as your forgot_password patch)
+          ok = (response.status.to_i >= 200 && response.status.to_i < 300)
+
+          # Best-effort map login->user (may be nil)
+          u = ::PasswordResetWebhook.find_user_from_login(login)
+
+          form = ::PasswordResetWebhook.build_form(
+            event_name: "login_attempt",
+            user: u,
+            email: (u ? nil : login), # keep "email" field populated if no user resolved
+            reset_token: nil,
+            success: ok,
+            request_ip: ip,
+            user_agent: ua,
+            occurred_at_utc: Time.now.utc.iso8601,
+            extra: {
+              "login" => login.to_s.strip
+            }
+          )
+
+          ::PasswordResetWebhook.enqueue(form)
+          result
+        rescue => e
+          # If something goes wrong in our patch, do not block login; just log
+          begin
+            ::PasswordResetWebhook.log_warn("login_attempt hook error: #{e.class}: #{e.message}")
+          rescue StandardError
+          end
+          raise
+        end
+      end
+
+      ::SessionController.prepend(::PasswordResetWebhook::SessionLoginAttemptPatch)
+      installed << "SessionController#create (login_attempt)"
+    else
+      Rails.logger.warn("[discourse-password-reset-webhook] SessionController#create not found; login hook not installed.")
+    end
+  rescue => e
+    Rails.logger.warn("[discourse-password-reset-webhook] failed to patch SessionController#create: #{e.class}: #{e.message}")
+  end
 
   # ============================================================
   # 1) Password reset requested: SessionController#forgot_password
