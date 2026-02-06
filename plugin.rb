@@ -2,12 +2,14 @@
 
 # name: discourse-password-reset-webhook
 # about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq).
-# version: 1.4.1
+# version: 1.5.0
 # authors: you
 
 after_initialize do
   require "uri"
   require "digest"
+  require "net/http"
+  require "time"
 
   module ::PasswordResetWebhook
     PLUGIN_NAME = "discourse-password-reset-webhook"
@@ -17,17 +19,30 @@ after_initialize do
     # =========================
     ENDPOINT_URL  = "http://172.17.0.1:8081/password_reset_update.php"
     SECRET_FIELD  = ""  # optional; sent as form field "secret" if not blank
-    TIMEOUT_SEC   = 3
-    OPEN_TIMEOUT  = 2
+    TIMEOUT_SEC   = 3   # read timeout
+    OPEN_TIMEOUT  = 2   # connect timeout
+    WRITE_TIMEOUT = 3   # only if supported
     ENABLED       = true
+    DEBUG_LOG     = false
     # =========================
+
+    def self.dlog(msg)
+      return unless DEBUG_LOG
+      Rails.logger.warn("[#{PLUGIN_NAME}] DEBUG #{msg}")
+    rescue StandardError
+    end
+
+    def self.log_warn(msg)
+      Rails.logger.warn("[#{PLUGIN_NAME}] #{msg}")
+    rescue StandardError
+    end
 
     def self.endpoint_uri
       @endpoint_uri ||= begin
         s = ENDPOINT_URL.to_s.strip
-        u = URI.parse(s)
-        u
-      rescue
+        return nil if s.empty?
+        URI.parse(s)
+      rescue StandardError
         nil
       end
     end
@@ -35,7 +50,12 @@ after_initialize do
     def self.enabled?
       return false unless ENABLED
       uri = endpoint_uri
-      uri && uri.is_a?(URI) && uri.scheme.present? && uri.host.present?
+      return false if uri.nil?
+      return false if uri.scheme.to_s.strip.empty?
+      return false if uri.host.to_s.strip.empty?
+      true
+    rescue StandardError
+      false
     end
 
     def self.build_form(event_name:, user: nil, email: nil, reset_token: nil, success: nil,
@@ -73,29 +93,43 @@ after_initialize do
       form["secret"] = sec if sec.length > 0
 
       form
+    rescue StandardError
+      { "event" => event_name.to_s, "occurred_at_utc" => (occurred_at_utc || Time.now.utc.iso8601).to_s }
     end
 
+    # Option B: Use Net::HTTP directly (bypasses FinalDestination SSRF checks)
     def self.post_form_now(form)
       return unless enabled?
 
-      body = URI.encode_www_form(form)
-      uri  = endpoint_uri
-      return unless uri
+      uri = endpoint_uri
+      return if uri.nil?
 
-      FinalDestination::HTTP.post(
-        uri, # IMPORTANT: must be URI, not String
-        body: body,
-        headers: { "Content-Type" => "application/x-www-form-urlencoded" },
-        timeout: TIMEOUT_SEC,
-        open_timeout: OPEN_TIMEOUT
-      )
+      body = URI.encode_www_form(form)
+
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == "https")
+      http.open_timeout = OPEN_TIMEOUT
+      http.read_timeout = TIMEOUT_SEC
+      http.write_timeout = WRITE_TIMEOUT if http.respond_to?(:write_timeout=)
+
+      req = Net::HTTP::Post.new(uri.request_uri)
+      req["Content-Type"] = "application/x-www-form-urlencoded"
+      req["User-Agent"] = "Discourse/#{Discourse::VERSION::STRING} #{PLUGIN_NAME}"
+      req.body = body
+
+      resp = nil
+      http.start { |h| resp = h.request(req) }
+
+      code = (resp&.code.to_i rescue 0)
+      dlog("POST OK code=#{code}") if code > 0
+      resp
     end
 
     def self.enqueue(form)
       return unless enabled?
       Jobs.enqueue(:password_reset_webhook_post, form: form)
     rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] enqueue failed: #{e.class}: #{e.message}")
+      log_warn("enqueue failed: #{e.class}: #{e.message}")
     end
   end
 
@@ -137,7 +171,7 @@ after_initialize do
           login = nil
           begin
             login = params[:login] || params[:email] || params["login"] || params["email"]
-          rescue
+          rescue StandardError
             login = nil
           end
 
@@ -197,7 +231,7 @@ after_initialize do
               token =
                 params[:token] || params[:reset_token] || params[:password_reset_token] ||
                 params["token"] || params["reset_token"] || params["password_reset_token"]
-            rescue
+            rescue StandardError
               token = nil
             end
 
@@ -207,7 +241,7 @@ after_initialize do
 
             form = ::PasswordResetWebhook.build_form(
               event_name: "password_reset_completed",
-              user: (current_user rescue nil),
+              user: (current_user rescue nil), # may be nil; OK
               email: nil,
               reset_token: token,
               success: success,
@@ -219,6 +253,7 @@ after_initialize do
 
             result
           rescue => e
+            # best-effort report failure event too
             begin
               form = ::PasswordResetWebhook.build_form(
                 event_name: "password_reset_completed",
@@ -231,7 +266,7 @@ after_initialize do
                 occurred_at_utc: Time.now.utc.iso8601
               )
               ::PasswordResetWebhook.enqueue(form)
-            rescue
+            rescue StandardError
               # ignore
             end
             raise
