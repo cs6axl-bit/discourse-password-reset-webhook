@@ -2,10 +2,13 @@
 
 # name: discourse-password-reset-webhook
 # about: Sends form-urlencoded webhook to PHP endpoint when password reset is requested and when it is completed (async via Sidekiq).
-# version: 1.4.0
+# version: 1.4.1
 # authors: you
 
 after_initialize do
+  require "uri"
+  require "digest"
+
   module ::PasswordResetWebhook
     PLUGIN_NAME = "discourse-password-reset-webhook"
 
@@ -19,8 +22,20 @@ after_initialize do
     ENABLED       = true
     # =========================
 
+    def self.endpoint_uri
+      @endpoint_uri ||= begin
+        s = ENDPOINT_URL.to_s.strip
+        u = URI.parse(s)
+        u
+      rescue
+        nil
+      end
+    end
+
     def self.enabled?
-      ENABLED && ENDPOINT_URL.to_s.strip.length > 0
+      return false unless ENABLED
+      uri = endpoint_uri
+      uri && uri.is_a?(URI) && uri.scheme.present? && uri.host.present?
     end
 
     def self.build_form(event_name:, user: nil, email: nil, reset_token: nil, success: nil,
@@ -64,9 +79,11 @@ after_initialize do
       return unless enabled?
 
       body = URI.encode_www_form(form)
+      uri  = endpoint_uri
+      return unless uri
 
       FinalDestination::HTTP.post(
-        ENDPOINT_URL,
+        uri, # IMPORTANT: must be URI, not String
         body: body,
         headers: { "Content-Type" => "application/x-www-form-urlencoded" },
         timeout: TIMEOUT_SEC,
@@ -112,7 +129,7 @@ after_initialize do
   begin
     if defined?(::SessionController) && ::SessionController.method_defined?(:forgot_password)
       module ::PasswordResetWebhook::SessionForgotPasswordPatch
-        def forgot_password
+        def forgot_password(*args)
           req = request
           ip = (req&.remote_ip rescue nil)
           ua = (req&.user_agent rescue nil)
@@ -124,7 +141,7 @@ after_initialize do
             login = nil
           end
 
-          result = super
+          result = super(*args)
 
           success = (response.status.to_i >= 200 && response.status.to_i < 300)
 
@@ -159,18 +176,18 @@ after_initialize do
   begin
     if defined?(::UsersController)
       candidates = [
-        :password_reset,          # some versions
-        :password_reset_perform,  # some versions
-        :reset_password,          # some versions
-        :update_password,         # some versions
-        :password_reset_update    # some versions
+        :password_reset,
+        :password_reset_perform,
+        :reset_password,
+        :update_password,
+        :password_reset_update
       ]
 
       found = candidates.find { |m| ::UsersController.method_defined?(m) }
 
       if found
         patch_mod = Module.new do
-          define_method(found) do
+          define_method(found) do |*args|
             req = request
             ip = (req&.remote_ip rescue nil)
             ua = (req&.user_agent rescue nil)
@@ -184,13 +201,13 @@ after_initialize do
               token = nil
             end
 
-            result = super()
+            result = super(*args)
 
             success = (response.status.to_i >= 200 && response.status.to_i < 300)
 
             form = ::PasswordResetWebhook.build_form(
               event_name: "password_reset_completed",
-              user: (current_user rescue nil), # may be nil; that's OK
+              user: (current_user rescue nil),
               email: nil,
               reset_token: token,
               success: success,
@@ -202,7 +219,6 @@ after_initialize do
 
             result
           rescue => e
-            # try to report failure event too
             begin
               form = ::PasswordResetWebhook.build_form(
                 event_name: "password_reset_completed",
